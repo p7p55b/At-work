@@ -1,0 +1,41 @@
+# Repertoires de compilation
+build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Artefacts binaires et objets C++
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.map
+
+# Configuration locale & identifiants prives (token iCal, client ID)
+config.ini
+*.ini
+
+# Fichiers temporaires et journaux
+*.log
+*.tmp
+*.dmp
+
+# Environnements IDE (Visual Studio, VS Code, CLion)
+.vs/
+.vscode/
+*.user
+*.suo
+*.useros
+*.sln.docstates
+
+# Systemes d'exploitation
+Thumbs.db
+Desktop.ini
+
+# Documentation interne
+STUDIO_DESIGN_SYSTEM.md
