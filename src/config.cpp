@@ -46,6 +46,7 @@ std::wstring CfgMgr::get_pth() {
 
 AppCfg CfgMgr::crt_dflt() {
     AppCfg c;
+    c.setup_completed = true;
     c.client_id = "1559498097938407464";
     c.ical_url = "";
     c.auto_sync = true;

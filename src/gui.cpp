@@ -335,6 +335,21 @@ inline static Gdiplus::Bitmap* load_bitmap_from_bytes(const std::vector<uint8_t>
 static bool prs_tm_sngl(const std::string& s, int& out_h, int& out_m) {
     out_h = 0;
     out_m = 0;
+    std::string digits;
+    for (char c : s) {
+        if (c >= '0' && c <= '9') digits.push_back(c);
+    }
+    if (s.find(':') == std::string::npos && s.find('h') == std::string::npos && s.find('H') == std::string::npos) {
+        if (digits.size() == 4) {
+            out_h = std::stoi(digits.substr(0, 2));
+            out_m = std::stoi(digits.substr(2, 2));
+            return (out_h >= 0 && out_h <= 23 && out_m >= 0 && out_m <= 59);
+        } else if (digits.size() == 3) {
+            out_h = std::stoi(digits.substr(0, 1));
+            out_m = std::stoi(digits.substr(1, 2));
+            return (out_h >= 0 && out_h <= 23 && out_m >= 0 && out_m <= 59);
+        }
+    }
     std::regex tm_ptrn(R"((\d{1,2})(?:[:hH](\d{1,2}))?)");
     std::smatch mtch;
     if (std::regex_search(s, mtch, tm_ptrn)) {
@@ -345,6 +360,14 @@ static bool prs_tm_sngl(const std::string& s, int& out_h, int& out_m) {
         return (out_h >= 0 && out_h <= 23 && out_m >= 0 && out_m <= 59);
     }
     return false;
+}
+
+static std::string normalize_time_str(const std::string& s, const std::string& fallback) {
+    int h = 0, m = 0;
+    if (!prs_tm_sngl(s, h, m)) return fallback;
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
+    return std::string(buf);
 }
 
 inline static bool parse_time_single(const std::string& input, int& out_h, int& out_m) {
@@ -1877,10 +1900,10 @@ void MainWindow::on_clr_act_clk() {
 void MainWindow::on_apply_cstm_clk() {
     m_config.custom_details = get_window_text_utf8(m_edit_details);
     m_config.custom_state = get_window_text_utf8(m_edit_state);
-    m_config.custom_time_from = get_window_text_utf8(m_edit_time_from);
-    m_config.custom_time_to = get_window_text_utf8(m_edit_time_to);
-    if (m_config.custom_time_from.empty()) m_config.custom_time_from = "09:00";
-    if (m_config.custom_time_to.empty())   m_config.custom_time_to   = "18:00";
+    m_config.custom_time_from = normalize_time_str(get_window_text_utf8(m_edit_time_from), "09:00");
+    m_config.custom_time_to   = normalize_time_str(get_window_text_utf8(m_edit_time_to), "18:00");
+    SetWindowTextW(m_edit_time_from, utf8_to_wide(m_config.custom_time_from).c_str());
+    SetWindowTextW(m_edit_time_to,   utf8_to_wide(m_config.custom_time_to).c_str());
     m_config.custom_time_range = "from " + m_config.custom_time_from + " to " + m_config.custom_time_to;
     m_config.custom_large_image = resolve_image_url(get_window_text_utf8(m_edit_large_img));
     m_config.custom_small_image = resolve_image_url(get_window_text_utf8(m_edit_small_img));
@@ -1925,10 +1948,10 @@ void MainWindow::on_sv_prst_clk() {
     std::string state   = get_window_text_utf8(m_edit_state);
     std::string large     = resolve_image_url(get_window_text_utf8(m_edit_large_img));
     std::string small_img = resolve_image_url(get_window_text_utf8(m_edit_small_img));
-    std::string t_from    = get_window_text_utf8(m_edit_time_from);
-    std::string t_to      = get_window_text_utf8(m_edit_time_to);
-    if (t_from.empty()) t_from = "09:00";
-    if (t_to.empty())   t_to   = "18:00";
+    std::string t_from    = normalize_time_str(get_window_text_utf8(m_edit_time_from), "09:00");
+    std::string t_to      = normalize_time_str(get_window_text_utf8(m_edit_time_to), "18:00");
+    SetWindowTextW(m_edit_time_from, utf8_to_wide(t_from).c_str());
+    SetWindowTextW(m_edit_time_to,   utf8_to_wide(t_to).c_str());
     std::string tr = "from " + t_from + " to " + t_to;
 
     bool found = false;
@@ -2467,9 +2490,57 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_COMMAND: {
+            HWND ctrl_hwnd = reinterpret_cast<HWND>(lp);
             if (HIWORD(wp) == EN_CHANGE) {
+                if (ctrl_hwnd && (ctrl_hwnd == m_edit_time_from || ctrl_hwnd == m_edit_time_to)) {
+                    static bool s_formatting = false;
+                    static std::wstring s_prev_from = L"09:00";
+                    static std::wstring s_prev_to   = L"18:00";
+                    if (!s_formatting) {
+                        std::wstring& prev = (ctrl_hwnd == m_edit_time_from) ? s_prev_from : s_prev_to;
+                        int len = GetWindowTextLengthW(ctrl_hwnd);
+                        std::wstring raw(len > 0 ? len : 0, L'\0');
+                        if (len > 0) {
+                            GetWindowTextW(ctrl_hwnd, &raw[0], len + 1);
+                        }
+                        bool is_deleting = (raw.size() < prev.size());
+                        std::wstring digits;
+                        for (wchar_t c : raw) {
+                            if (c >= L'0' && c <= L'9' && digits.size() < 4) {
+                                digits.push_back(c);
+                            }
+                        }
+                        std::wstring formatted;
+                        if (digits.size() >= 3) {
+                            formatted = digits.substr(0, 2) + L":" + digits.substr(2);
+                        } else if (digits.size() == 2) {
+                            formatted = is_deleting ? digits : (digits + L":");
+                        } else {
+                            formatted = digits;
+                        }
+                        prev = formatted;
+                        if (formatted != raw) {
+                            s_formatting = true;
+                            SetWindowTextW(ctrl_hwnd, formatted.c_str());
+                            int end_pos = static_cast<int>(formatted.size());
+                            SendMessageW(ctrl_hwnd, EM_SETSEL, end_pos, end_pos);
+                            s_formatting = false;
+                        }
+                    }
+                }
                 if (m_current_view == ViewMode::Activity && m_show_preview) {
                     InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            } else if (HIWORD(wp) == EN_KILLFOCUS) {
+                if (ctrl_hwnd && (ctrl_hwnd == m_edit_time_from || ctrl_hwnd == m_edit_time_to)) {
+                    std::string cur = get_window_text_utf8(ctrl_hwnd);
+                    if (!cur.empty()) {
+                        std::string fallback = (ctrl_hwnd == m_edit_time_from) ? "09:00" : "18:00";
+                        std::string norm = normalize_time_str(cur, fallback);
+                        if (norm != cur) {
+                            SetWindowTextW(ctrl_hwnd, utf8_to_wide(norm).c_str());
+                        }
+                    }
                 }
             }
             int id = LOWORD(wp);
