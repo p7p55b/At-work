@@ -315,6 +315,17 @@ bool RpcClnt::is_cnnctd() const {
     return m_is_cnnctd;
 }
 
+static void drn_pp_hndl(HANDLE pp) {
+    if (pp == INVALID_HANDLE_VALUE) return;
+    DWORD avail = 0;
+    char buf[4096];
+    while (PeekNamedPipe(pp, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+        DWORD to_rd = (avail < sizeof(buf)) ? avail : static_cast<DWORD>(sizeof(buf));
+        DWORD rd = 0;
+        if (!ReadFile(pp, buf, to_rd, &rd, nullptr) || rd == 0) break;
+    }
+}
+
 bool RpcClnt::set_actvty(const Actvty& a) {
     std::lock_guard<std::recursive_mutex> lck(m_mtx);
     if (!m_is_cnnctd || m_pp == INVALID_HANDLE_VALUE) {
@@ -322,7 +333,19 @@ bool RpcClnt::set_actvty(const Actvty& a) {
         return false;
     }
 
+    drn_pp_hndl(m_pp);
+
     DWORD pid = GetCurrentProcessId();
+
+    // Reset the socket slot first so V8/Discord re-inserts our activity as the newest/top priority RPC
+    {
+        uint32_t clr_nnc = m_nnc++;
+        std::ostringstream clr_ss;
+        clr_ss << "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" << pid << ",\"activity\":null},\"nonce\":\"" << clr_nnc << "\"}";
+        wrt_frm(OP_FRM, clr_ss.str());
+        drn_pp_hndl(m_pp);
+    }
+
     uint32_t nnc = m_nnc++;
 
     std::ostringstream ss;
@@ -330,24 +353,20 @@ bool RpcClnt::set_actvty(const Actvty& a) {
        << "\"cmd\":\"SET_ACTIVITY\","
        << "\"args\":{"
        << "\"pid\":" << pid << ","
-       << "\"activity\":{";
-
-    bool has_fld = false;
+       << "\"activity\":{"
+       << "\"type\":0,"
+       << "\"instance\":true";
 
     if (!a.details.empty()) {
-        ss << "\"details\":\"" << esc_json(a.details) << "\"";
-        has_fld = true;
+        ss << ",\"details\":\"" << esc_json(a.details) << "\"";
     }
 
     if (!a.state.empty()) {
-        if (has_fld) ss << ",";
-        ss << "\"state\":\"" << esc_json(a.state) << "\"";
-        has_fld = true;
+        ss << ",\"state\":\"" << esc_json(a.state) << "\"";
     }
 
     if (!a.large_image.empty() || !a.small_image.empty()) {
-        if (has_fld) ss << ",";
-        ss << "\"assets\":{";
+        ss << ",\"assets\":{";
         bool has_asst = false;
         if (!a.large_image.empty()) {
             ss << "\"large_image\":\"" << esc_json(a.large_image) << "\"";
@@ -364,12 +383,10 @@ bool RpcClnt::set_actvty(const Actvty& a) {
             }
         }
         ss << "}";
-        has_fld = true;
     }
 
     if (a.start_time > 0 || a.end_time > 0) {
-        if (has_fld) ss << ",";
-        ss << "\"timestamps\":{";
+        ss << ",\"timestamps\":{";
         bool has_tm = false;
         if (a.start_time > 0) {
             ss << "\"start\":" << a.start_time;
@@ -393,6 +410,7 @@ bool RpcClnt::set_actvty(const Actvty& a) {
         return false;
     }
 
+    drn_pp_hndl(m_pp);
     return true;
 }
 
@@ -401,6 +419,8 @@ bool RpcClnt::clr_actvty() {
     if (!m_is_cnnctd || m_pp == INVALID_HANDLE_VALUE) {
         return false;
     }
+
+    drn_pp_hndl(m_pp);
 
     DWORD pid = GetCurrentProcessId();
     uint32_t nnc = m_nnc++;
@@ -417,6 +437,7 @@ bool RpcClnt::clr_actvty() {
         return false;
     }
 
+    drn_pp_hndl(m_pp);
     return true;
 }
 

@@ -384,28 +384,18 @@ static bool prs_tm_prts(const std::string& s_frm, const std::string& s_to, int64
     bool has_frm = prs_tm_sngl(s_frm, h1, m1);
     bool has_to  = prs_tm_sngl(s_to, h2, m2);
 
-    if (!has_frm && !has_to) {
-        out_s = static_cast<int64_t>(nw);
-        out_e = 0;
+    if (!has_frm || !has_to) {
         return false;
     }
 
     std::tm tm_nw{};
     localtime_s(&tm_nw, &nw);
 
-    if (!has_to) {
-        std::tm tm_s = tm_nw;
-        tm_s.tm_hour = h1;
-        tm_s.tm_min = m1;
-        tm_s.tm_sec = 0;
-        std::time_t t_s = std::mktime(&tm_s);
-        if (t_s > nw) {
-            t_s -= 24 * 3600;
-        }
-        out_s = static_cast<int64_t>(t_s);
-        out_e = 0;
-        return true;
-    }
+    std::tm tm_s = tm_nw;
+    tm_s.tm_hour = h1;
+    tm_s.tm_min = m1;
+    tm_s.tm_sec = 0;
+    std::time_t t_s = std::mktime(&tm_s);
 
     std::tm tm_e = tm_nw;
     tm_e.tm_hour = h2;
@@ -413,25 +403,29 @@ static bool prs_tm_prts(const std::string& s_frm, const std::string& s_to, int64
     tm_e.tm_sec = 0;
     std::time_t t_e = std::mktime(&tm_e);
 
-    if (has_frm) {
-        if (h2 < h1 || (h2 == h1 && m2 < m1)) {
-            if (tm_nw.tm_hour >= h1) {
-                t_e += 24 * 3600;
-            }
-        } else {
-            if (t_e <= nw) {
-                t_e += 24 * 3600;
-            }
+    if (h1 < h2 || (h1 == h2 && m1 < m2)) {
+        // Plage en journee (ex: 09:00 -> 18:00)
+        if (nw >= t_s && nw < t_e) {
+            out_s = 0;
+            out_e = static_cast<int64_t>(t_e);
+            return true;
         }
-    } else {
-        if (t_e <= nw) {
-            t_e += 24 * 3600;
+        return false;
+    } else if (h1 > h2 || (h1 == h2 && m1 > m2)) {
+        // Plage de nuit passant minuit (ex: 22:00 -> 02:00)
+        if (nw >= t_s) {
+            out_s = 0;
+            out_e = static_cast<int64_t>(t_e + 24 * 3600);
+            return true;
+        } else if (nw < t_e) {
+            out_s = 0;
+            out_e = static_cast<int64_t>(t_e);
+            return true;
         }
+        return false;
     }
 
-    out_s = 0;
-    out_e = static_cast<int64_t>(t_e);
-    return true;
+    return false;
 }
 
 static bool parse_time_parts(const std::string& from_str, const std::string& to_str, int64_t& out_start, int64_t& out_end) {
@@ -1466,8 +1460,13 @@ void MainWindow::drw_dsc_prvw(HDC hdc, const RECT& preview_rc) {
         Gdiplus::SolidBrush sdot_brush(m_rpc_is_online ? Gdiplus::Color(255, 35, 165, 89) : Gdiplus::Color(255, 128, 132, 142));
         g.FillEllipse(&sdot_brush, sdot_x, sdot_y, sdot_d, sdot_d);
 
-        // Image d'activite (Large Asset) avec coins arrondis si telechargee
-        if (m_asset_bitmap) {
+        std::string chk_from = get_window_text_utf8(m_edit_time_from);
+        std::string chk_to   = get_window_text_utf8(m_edit_time_to);
+        int64_t chk_s = 0, chk_e = 0;
+        bool chk_in_slot = parse_time_parts(chk_from, chk_to, chk_s, chk_e) || (m_cal_is_active && m_activity_end_time > std::time(nullptr));
+
+        // Image d'activite (Large Asset) avec coins arrondis si telechargee et dans la tranche active
+        if (chk_in_slot && m_asset_bitmap) {
             Gdiplus::GraphicsPath asset_path;
             int r = 8;
             int d = r * 2;
@@ -1521,145 +1520,142 @@ void MainWindow::drw_dsc_prvw(HDC hdc, const RECT& preview_rc) {
     LineTo(hdc, card_rc.right - 12, card_rc.top + 104);
     DeleteObject(sep_pen);
 
-    // Titre de section activite : PLAYING A GAME
-    SelectObject(hdc, m_font_discord_header);
-    SetTextColor(hdc, RGB(148, 155, 164));
-    TextOutW(hdc, card_rc.left + 14, card_rc.top + 110, L"PLAYING A GAME", 14);
-
-    // Placeholder pour l'Asset si aucun bitmap charge
-    if (!m_asset_bitmap) {
-        RECT asset_rc = { asset_x, asset_y, asset_x + asset_sz, asset_y + asset_sz };
-        HBRUSH asset_brush = CreateSolidBrush(RGB(43, 45, 49));
-        HPEN asset_pen = CreatePen(PS_SOLID, 1, RGB(55, 58, 64));
-        SelectObject(hdc, asset_brush);
-        SelectObject(hdc, asset_pen);
-        RoundRect(hdc, asset_rc.left, asset_rc.top, asset_rc.right, asset_rc.bottom, 8, 8);
-        DeleteObject(asset_brush);
-        DeleteObject(asset_pen);
-
-        bool is_gif = (live_large.find(".gif") != std::string::npos || live_large.find("giphy") != std::string::npos || live_large.find("tenor") != std::string::npos);
-        if (is_gif) {
-            RECT badge_rc = { asset_x + 12, asset_y + 19, asset_x + asset_sz - 12, asset_y + 39 };
-            HBRUSH blurple_brush = CreateSolidBrush(RGB(88, 101, 242));
-            SelectObject(hdc, blurple_brush);
-            SelectObject(hdc, m_pen_null);
-            RoundRect(hdc, badge_rc.left, badge_rc.top, badge_rc.right, badge_rc.bottom, 4, 4);
-            DeleteObject(blurple_brush);
-
-            SelectObject(hdc, m_font_badge);
-            SetTextColor(hdc, RGB(255, 255, 255));
-            DrawTextW(hdc, L"GIF", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        } else if (!live_large.empty()) {
-            RECT badge_rc = { asset_x + 12, asset_y + 19, asset_x + asset_sz - 12, asset_y + 39 };
-            HBRUSH img_brush = CreateSolidBrush(RGB(60, 64, 72));
-            SelectObject(hdc, img_brush);
-            SelectObject(hdc, m_pen_null);
-            RoundRect(hdc, badge_rc.left, badge_rc.top, badge_rc.right, badge_rc.bottom, 4, 4);
-            DeleteObject(img_brush);
-
-            SelectObject(hdc, m_font_badge);
-            SetTextColor(hdc, RGB(220, 222, 225));
-            DrawTextW(hdc, L"IMG", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            RECT badge_rc = { asset_x + 10, asset_y + 19, asset_x + asset_sz - 10, asset_y + 39 };
-            SelectObject(hdc, m_font_badge);
-            SetTextColor(hdc, RGB(148, 155, 164));
-            DrawTextW(hdc, L"RPC", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-    }
-
-    // Petit badge overlay si small_image present
-    if (!live_small.empty()) {
-        int sm_cx = asset_x + asset_sz - 8;
-        int sm_cy = asset_y + asset_sz - 8;
-        int sm_r = 10;
-        HBRUSH sm_brush = CreateSolidBrush(RGB(32, 34, 37));
-        HPEN sm_pen = CreatePen(PS_SOLID, 2, RGB(17, 18, 20));
-        SelectObject(hdc, sm_brush);
-        SelectObject(hdc, sm_pen);
-        Ellipse(hdc, sm_cx - sm_r, sm_cy - sm_r, sm_cx + sm_r, sm_cy + sm_r);
-        DeleteObject(sm_brush);
-        DeleteObject(sm_pen);
-
-        SelectObject(hdc, m_font_badge);
-        SetTextColor(hdc, theme::COLOR_ACCENT);
-        RECT sm_rc = { sm_cx - sm_r, sm_cy - sm_r, sm_cx + sm_r, sm_cy + sm_r };
-        DrawTextW(hdc, L"+", 1, &sm_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-
-    // Nom de l'application
-    std::string app_name = profile.app_name.empty() ? "At-Work" : profile.app_name;
-    if (profile.app_name.empty() && m_config.client_id == "383226320970055681") {
-        app_name = "Visual Studio Code";
-    }
-    int cur_text_y = asset_y + 1;
-    RECT rc_app = { text_x, cur_text_y, text_x + text_w, cur_text_y + 18 };
-    SelectObject(hdc, m_font_discord_app);
-    SetTextColor(hdc, RGB(242, 243, 245));
-    std::wstring wapp = utf8_to_wide(app_name);
-    DrawTextW(hdc, wapp.c_str(), -1, &rc_app, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    cur_text_y += 18 + 2;
-
-    // Details (paragraphe dynamique)
-    RECT rc_det = { text_x, cur_text_y, text_x + text_w, cur_text_y + det_h };
-    SelectObject(hdc, m_font_discord_sub);
-    SetTextColor(hdc, RGB(219, 222, 225));
-    DrawTextW(hdc, wdetails.c_str(), -1, &rc_det, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
-    cur_text_y += det_h + 2;
-
-    // State (paragraphe dynamique)
-    RECT rc_st = { text_x, cur_text_y, text_x + text_w, cur_text_y + st_h };
-    SelectObject(hdc, m_font_discord_sub);
-    SetTextColor(hdc, RGB(148, 155, 164));
-    DrawTextW(hdc, wstate.c_str(), -1, &rc_st, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
-    cur_text_y += st_h + 2;
-
-    // Timer / Compte a rebours Discord dynamique (positionne sous l'etat)
     std::time_t now = std::time(nullptr);
-    wchar_t time_buf[64] = {};
-
     std::string live_from = get_window_text_utf8(m_edit_time_from);
     std::string live_to   = get_window_text_utf8(m_edit_time_to);
 
     int64_t target_start = 0;
     int64_t target_end = 0;
     bool has_live_time = parse_time_parts(live_from, live_to, target_start, target_end);
-
-    if (!has_live_time) {
+    if (!has_live_time && m_cal_is_active && m_activity_end_time > now) {
         target_start = m_activity_start_time;
         target_end = m_activity_end_time;
+        has_live_time = true;
     }
 
-    if (target_end > now) {
-        int64_t rem = target_end - now;
-        int hrs = static_cast<int>(rem / 3600);
-        int mins = static_cast<int>((rem % 3600) / 60);
-        int secs = static_cast<int>(rem % 60);
-        if (hrs > 0) {
-            swprintf_s(time_buf, L"%d:%02d:%02d restant", hrs, mins, secs);
-        } else {
-            swprintf_s(time_buf, L"%02d:%02d restant", mins, secs);
+    if (has_live_time) {
+        // Titre de section activite : PLAYING A GAME
+        SelectObject(hdc, m_font_discord_header);
+        SetTextColor(hdc, RGB(148, 155, 164));
+        TextOutW(hdc, card_rc.left + 14, card_rc.top + 110, L"PLAYING A GAME", 14);
+
+        // Placeholder pour l'Asset si aucun bitmap charge
+        if (!m_asset_bitmap) {
+            RECT asset_rc = { asset_x, asset_y, asset_x + asset_sz, asset_y + asset_sz };
+            HBRUSH asset_brush = CreateSolidBrush(RGB(43, 45, 49));
+            HPEN asset_pen = CreatePen(PS_SOLID, 1, RGB(55, 58, 64));
+            SelectObject(hdc, asset_brush);
+            SelectObject(hdc, asset_pen);
+            RoundRect(hdc, asset_rc.left, asset_rc.top, asset_rc.right, asset_rc.bottom, 8, 8);
+            DeleteObject(asset_brush);
+            DeleteObject(asset_pen);
+
+            bool is_gif = (live_large.find(".gif") != std::string::npos || live_large.find("giphy") != std::string::npos || live_large.find("tenor") != std::string::npos);
+            if (is_gif) {
+                RECT badge_rc = { asset_x + 12, asset_y + 19, asset_x + asset_sz - 12, asset_y + 39 };
+                HBRUSH blurple_brush = CreateSolidBrush(RGB(88, 101, 242));
+                SelectObject(hdc, blurple_brush);
+                SelectObject(hdc, m_pen_null);
+                RoundRect(hdc, badge_rc.left, badge_rc.top, badge_rc.right, badge_rc.bottom, 4, 4);
+                DeleteObject(blurple_brush);
+
+                SelectObject(hdc, m_font_badge);
+                SetTextColor(hdc, RGB(255, 255, 255));
+                DrawTextW(hdc, L"GIF", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else if (!live_large.empty()) {
+                RECT badge_rc = { asset_x + 12, asset_y + 19, asset_x + asset_sz - 12, asset_y + 39 };
+                HBRUSH img_brush = CreateSolidBrush(RGB(60, 64, 72));
+                SelectObject(hdc, img_brush);
+                SelectObject(hdc, m_pen_null);
+                RoundRect(hdc, badge_rc.left, badge_rc.top, badge_rc.right, badge_rc.bottom, 4, 4);
+                DeleteObject(img_brush);
+
+                SelectObject(hdc, m_font_badge);
+                SetTextColor(hdc, RGB(220, 222, 225));
+                DrawTextW(hdc, L"IMG", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                RECT badge_rc = { asset_x + 10, asset_y + 19, asset_x + asset_sz - 10, asset_y + 39 };
+                SelectObject(hdc, m_font_badge);
+                SetTextColor(hdc, RGB(148, 155, 164));
+                DrawTextW(hdc, L"RPC", 3, &badge_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         }
-    } else if (target_end > 0 && target_end <= now) {
-        swprintf_s(time_buf, L"00:00 restant");
-    } else if (target_start > 0) {
-        int64_t elapsed = (now >= target_start) ? (now - target_start) : 0;
-        int mins = static_cast<int>(elapsed / 60);
-        int secs = static_cast<int>(elapsed % 60);
-        if (mins >= 60) {
-            int hrs = mins / 60;
-            mins %= 60;
-            swprintf_s(time_buf, L"%d:%02d:%02d ecoule", hrs, mins, secs);
-        } else {
-            swprintf_s(time_buf, L"%d:%02d ecoule", mins, secs);
+
+        // Petit badge overlay si small_image present
+        if (!live_small.empty()) {
+            int sm_cx = asset_x + asset_sz - 8;
+            int sm_cy = asset_y + asset_sz - 8;
+            int sm_r = 10;
+            HBRUSH sm_brush = CreateSolidBrush(RGB(32, 34, 37));
+            HPEN sm_pen = CreatePen(PS_SOLID, 2, RGB(17, 18, 20));
+            SelectObject(hdc, sm_brush);
+            SelectObject(hdc, sm_pen);
+            Ellipse(hdc, sm_cx - sm_r, sm_cy - sm_r, sm_cx + sm_r, sm_cy + sm_r);
+            DeleteObject(sm_brush);
+            DeleteObject(sm_pen);
+
+            SelectObject(hdc, m_font_badge);
+            SetTextColor(hdc, theme::COLOR_ACCENT);
+            RECT sm_rc = { sm_cx - sm_r, sm_cy - sm_r, sm_cx + sm_r, sm_cy + sm_r };
+            DrawTextW(hdc, L"+", 1, &sm_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        // Nom de l'application
+        std::string app_name = profile.app_name.empty() ? "At-Work" : profile.app_name;
+        if (profile.app_name.empty() && m_config.client_id == "383226320970055681") {
+            app_name = "Visual Studio Code";
+        }
+        int cur_text_y = asset_y + 1;
+        RECT rc_app = { text_x, cur_text_y, text_x + text_w, cur_text_y + 18 };
+        SelectObject(hdc, m_font_discord_app);
+        SetTextColor(hdc, RGB(242, 243, 245));
+        std::wstring wapp = utf8_to_wide(app_name);
+        DrawTextW(hdc, wapp.c_str(), -1, &rc_app, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        cur_text_y += 18 + 2;
+
+        // Details (paragraphe dynamique)
+        RECT rc_det = { text_x, cur_text_y, text_x + text_w, cur_text_y + det_h };
+        SelectObject(hdc, m_font_discord_sub);
+        SetTextColor(hdc, RGB(219, 222, 225));
+        DrawTextW(hdc, wdetails.c_str(), -1, &rc_det, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+        cur_text_y += det_h + 2;
+
+        // State (paragraphe dynamique)
+        RECT rc_st = { text_x, cur_text_y, text_x + text_w, cur_text_y + st_h };
+        SelectObject(hdc, m_font_discord_sub);
+        SetTextColor(hdc, RGB(148, 155, 164));
+        DrawTextW(hdc, wstate.c_str(), -1, &rc_st, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+        cur_text_y += st_h + 2;
+
+        // Timer / Compte a rebours Discord dynamique (uniquement dans la tranche active)
+        if (target_end > now) {
+            wchar_t time_buf[64] = {};
+            int64_t rem = target_end - now;
+            int hrs = static_cast<int>(rem / 3600);
+            int mins = static_cast<int>((rem % 3600) / 60);
+            int secs = static_cast<int>(rem % 60);
+            if (hrs > 0) {
+                swprintf_s(time_buf, L"%d:%02d:%02d restant", hrs, mins, secs);
+            } else {
+                swprintf_s(time_buf, L"%02d:%02d restant", mins, secs);
+            }
+            RECT rc_tm = { text_x, cur_text_y, text_x + text_w, cur_text_y + 16 };
+            SelectObject(hdc, m_font_discord_sub);
+            SetTextColor(hdc, RGB(148, 155, 164));
+            DrawTextW(hdc, time_buf, -1, &rc_tm, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
         }
     } else {
-        swprintf_s(time_buf, L"0:00 ecoule");
+        // Hors tranche horaire active : aucune activite ni timestamp affiche
+        SelectObject(hdc, m_font_discord_header);
+        SetTextColor(hdc, RGB(115, 120, 128));
+        TextOutW(hdc, card_rc.left + 14, card_rc.top + 118, L"AUCUNE ACTIVITE EN COURS", 24);
+
+        SelectObject(hdc, m_font_discord_sub);
+        SetTextColor(hdc, RGB(148, 155, 164));
+        std::wstring w_inactive = utf8_to_wide("Hors tranche active (" + live_from + " - " + live_to + ")");
+        RECT rc_inact = { card_rc.left + 14, card_rc.top + 138, card_rc.right - 14, card_rc.top + 160 };
+        DrawTextW(hdc, w_inactive.c_str(), -1, &rc_inact, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
-    RECT rc_tm = { text_x, cur_text_y, text_x + text_w, cur_text_y + 16 };
-    SelectObject(hdc, m_font_discord_sub);
-    SetTextColor(hdc, RGB(148, 155, 164));
-    DrawTextW(hdc, time_buf, -1, &rc_tm, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
     // Statut IPC bas de carte
     RECT stat_box = { card_rc.left + 14, card_bottom - 36, card_rc.right - 14, card_bottom - 12 };
@@ -1835,6 +1831,19 @@ void MainWindow::on_rcnnct_clk() {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
+namespace {
+    struct SchedActState {
+        bool active = false;
+        bool was_in_slot = false;
+        std::string label;
+        std::string time_from;
+        std::string time_to;
+        discord::Activity act;
+        std::time_t last_reassert = 0;
+    };
+    static SchedActState g_sched;
+}
+
 void MainWindow::on_prst_clk(size_t index) {
     if (index >= m_config.presets.size()) return;
 
@@ -1845,8 +1854,8 @@ void MainWindow::on_prst_clk(size_t index) {
     SetWindowTextW(m_edit_state, utf8_to_wide(p.state).c_str());
     SetWindowTextW(m_edit_large_img, utf8_to_wide(p.large_image).c_str());
     SetWindowTextW(m_edit_small_img, utf8_to_wide(p.small_image).c_str());
-    std::string t_from = p.time_from.empty() ? "09:00" : p.time_from;
-    std::string t_to   = p.time_to.empty()   ? "18:00" : p.time_to;
+    std::string t_from = normalize_time_str(p.time_from.empty() ? "09:00" : p.time_from, "09:00");
+    std::string t_to   = normalize_time_str(p.time_to.empty()   ? "18:00" : p.time_to,   "18:00");
     SetWindowTextW(m_edit_time_from, utf8_to_wide(t_from).c_str());
     SetWindowTextW(m_edit_time_to,   utf8_to_wide(t_to).c_str());
 
@@ -1866,27 +1875,46 @@ void MainWindow::on_prst_clk(size_t index) {
     act.large_text = p.large_text;
     act.small_image = resolve_image_url(p.small_image);
     act.small_text = p.small_text;
-    parse_time_parts(t_from, t_to, act.start_time, act.end_time);
+    bool in_slot = parse_time_parts(t_from, t_to, act.start_time, act.end_time);
+
+    g_sched.active = true;
+    g_sched.label = p.label;
+    g_sched.time_from = t_from;
+    g_sched.time_to = t_to;
+    g_sched.act = act;
 
     if (!m_rpc.is_connected()) {
         on_rcnnct_clk();
     }
 
     if (m_rpc.is_connected()) {
-        if (m_rpc.set_activity(act)) {
-            m_activity_start_time = act.start_time;
-            m_activity_end_time = act.end_time;
-            upd_rpc_st_lbl("actif [" + p.label + "]", true);
-            log_dbg("RPC", "Preset applique [" + p.label + "]: " + p.details + " / " + p.state);
+        if (in_slot) {
+            if (m_rpc.set_activity(act)) {
+                m_activity_start_time = act.start_time;
+                m_activity_end_time = act.end_time;
+                g_sched.was_in_slot = true;
+                g_sched.last_reassert = std::time(nullptr);
+                upd_rpc_st_lbl("actif [" + p.label + "]", true);
+                log_dbg("RPC", "Preset applique [" + p.label + "]: " + p.details + " / " + p.state);
+            } else {
+                upd_rpc_st_lbl("erreur envoi: " + m_rpc.get_last_error(), false);
+                log_dbg("RPC", "Erreur envoi preset: " + m_rpc.get_last_error());
+            }
         } else {
-            upd_rpc_st_lbl("erreur envoi: " + m_rpc.get_last_error(), false);
-            log_dbg("RPC", "Erreur envoi preset: " + m_rpc.get_last_error());
+            m_rpc.clear_activity();
+            m_activity_start_time = 0;
+            m_activity_end_time = 0;
+            g_sched.was_in_slot = false;
+            upd_rpc_st_lbl("hors tranche (" + t_from + " - " + t_to + ") - activite masquee", true);
+            log_dbg("RPC", "Preset [" + p.label + "] hors tranche active (" + t_from + " - " + t_to + "): activite masquee sur Discord.");
         }
     }
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 void MainWindow::on_clr_act_clk() {
+    g_sched.active = false;
+    g_sched.was_in_slot = false;
     m_activity_start_time = 0;
     m_activity_end_time = 0;
     if (m_rpc.is_connected()) {
@@ -1911,28 +1939,45 @@ void MainWindow::on_apply_cstm_clk() {
     SetWindowTextW(m_edit_small_img, utf8_to_wide(m_config.custom_small_image).c_str());
     config::ConfigManager::save(m_config);
 
+    discord::Activity act;
+    act.details = m_config.custom_details;
+    act.state = m_config.custom_state;
+    act.large_image = m_config.custom_large_image;
+    act.large_text = m_config.custom_details;
+    act.small_image = m_config.custom_small_image;
+    act.small_text = m_config.custom_state;
+    bool in_slot = parse_time_parts(m_config.custom_time_from, m_config.custom_time_to, act.start_time, act.end_time);
+
+    g_sched.active = true;
+    g_sched.label = "Custom";
+    g_sched.time_from = m_config.custom_time_from;
+    g_sched.time_to = m_config.custom_time_to;
+    g_sched.act = act;
+
     if (!m_rpc.is_connected()) {
         on_rcnnct_clk();
     }
 
     if (m_rpc.is_connected()) {
-        discord::Activity act;
-        act.details = m_config.custom_details;
-        act.state = m_config.custom_state;
-        act.large_image = m_config.custom_large_image;
-        act.large_text = m_config.custom_details;
-        act.small_image = m_config.custom_small_image;
-        act.small_text = m_config.custom_state;
-        parse_time_parts(m_config.custom_time_from, m_config.custom_time_to, act.start_time, act.end_time);
-
-        if (m_rpc.set_activity(act)) {
-            m_activity_start_time = act.start_time;
-            m_activity_end_time = act.end_time;
-            upd_rpc_st_lbl("activite personnalisee activee", true);
-            log_dbg("RPC", "Activite manuelle appliquee: " + act.details + " / " + act.state + " [" + m_config.custom_time_range + "]");
+        if (in_slot) {
+            if (m_rpc.set_activity(act)) {
+                m_activity_start_time = act.start_time;
+                m_activity_end_time = act.end_time;
+                g_sched.was_in_slot = true;
+                g_sched.last_reassert = std::time(nullptr);
+                upd_rpc_st_lbl("activite personnalisee activee", true);
+                log_dbg("RPC", "Activite manuelle appliquee: " + act.details + " / " + act.state + " [" + m_config.custom_time_range + "]");
+            } else {
+                upd_rpc_st_lbl("erreur transmission payload", true);
+                log_dbg("RPC", "Erreur transmission activite: " + m_rpc.get_last_error());
+            }
         } else {
-            upd_rpc_st_lbl("erreur transmission payload", true);
-            log_dbg("RPC", "Erreur transmission activite: " + m_rpc.get_last_error());
+            m_rpc.clear_activity();
+            m_activity_start_time = 0;
+            m_activity_end_time = 0;
+            g_sched.was_in_slot = false;
+            upd_rpc_st_lbl("hors tranche (" + m_config.custom_time_from + " - " + m_config.custom_time_to + ") - activite masquee", true);
+            log_dbg("RPC", "Activite manuelle hors tranche active (" + m_config.custom_time_from + " - " + m_config.custom_time_to + "): activite masquee sur Discord.");
         }
     }
     InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -2756,6 +2801,38 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 return 0;
             } else if (wp == TIMER_ID_TICK) {
+                std::time_t now = std::time(nullptr);
+                if (g_sched.active && m_rpc.is_connected()) {
+                    bool in_slot = parse_time_parts(g_sched.time_from, g_sched.time_to, g_sched.act.start_time, g_sched.act.end_time);
+                    if (in_slot) {
+                        m_activity_start_time = g_sched.act.start_time;
+                        m_activity_end_time = g_sched.act.end_time;
+                        if (!g_sched.was_in_slot || (now - g_sched.last_reassert >= 10)) {
+                            if (m_rpc.set_activity(g_sched.act)) {
+                                if (!g_sched.was_in_slot) {
+                                    upd_rpc_st_lbl("actif [" + g_sched.label + "]", true);
+                                    log_dbg("RPC", "Debut de tranche active (" + g_sched.time_from + " - " + g_sched.time_to + "): activite affichee.");
+                                }
+                                g_sched.was_in_slot = true;
+                                g_sched.last_reassert = now;
+                            }
+                        }
+                    } else if (g_sched.was_in_slot) {
+                        m_rpc.clear_activity();
+                        m_activity_start_time = 0;
+                        m_activity_end_time = 0;
+                        g_sched.was_in_slot = false;
+                        upd_rpc_st_lbl("hors tranche (" + g_sched.time_from + " - " + g_sched.time_to + ") - activite masquee", true);
+                        log_dbg("RPC", "Fin de tranche active (" + g_sched.time_from + " - " + g_sched.time_to + "): activite effacee.");
+                    }
+                } else if (m_cal_is_active && m_activity_end_time > 0 && now >= m_activity_end_time) {
+                    if (m_rpc.is_connected()) {
+                        m_rpc.clear_activity();
+                    }
+                    m_activity_start_time = 0;
+                    m_activity_end_time = 0;
+                    upd_cal_st_lbl("aucun evenement actif", false);
+                }
                 if (m_current_view == ViewMode::Activity && m_show_preview) {
                     InvalidateRect(m_hwnd, nullptr, FALSE);
                 }
