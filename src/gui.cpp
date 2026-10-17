@@ -2604,10 +2604,12 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Systray
             if (id == ID_TRAY_OPEN) {
+                ShowWindow(m_hwnd, SW_SHOW);
                 ShowWindow(m_hwnd, SW_RESTORE);
                 SetForegroundWindow(m_hwnd);
                 return 0;
             } else if (id == ID_TRAY_SETTINGS) {
+                ShowWindow(m_hwnd, SW_SHOW);
                 ShowWindow(m_hwnd, SW_RESTORE);
                 SetForegroundWindow(m_hwnd);
                 swtch_vw(ViewMode::DebugSettings);
@@ -2638,6 +2640,7 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_TRAY_NOTIFY: {
             if (lp == WM_LBUTTONDBLCLK) {
+                ShowWindow(m_hwnd, SW_SHOW);
                 ShowWindow(m_hwnd, SW_RESTORE);
                 SetForegroundWindow(m_hwnd);
             } else if (lp == WM_RBUTTONUP) {
