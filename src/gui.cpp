@@ -116,13 +116,64 @@ constexpr int ID_TRAY_EXIT         = 3005;
 struct CalSyncRes {
     bool success = false;
     std::string summary;
+    std::time_t start_time = 0;
     std::time_t end_time = 0;
+    std::vector<cal::CalEvnt> upcoming;
 
     bool ok() const { return success; }
     const std::string& smm() const { return summary; }
     std::time_t tm_e() const { return end_time; }
 };
 using CalendarSyncResult = CalSyncRes;
+
+static std::vector<cal::CalEvnt> g_upcoming_evs;
+static std::optional<cal::CalEvnt> g_current_cal_ev;
+
+static std::string fmt_ev_slot(const cal::CalEvnt& ev) {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now = {}, tm_s = {}, tm_e = {};
+    localtime_s(&tm_now, &now);
+    localtime_s(&tm_s, &ev.start_time);
+    localtime_s(&tm_e, &ev.end_time);
+
+    std::time_t next_day_ts = now + 24 * 3600;
+    std::tm tm_tom = {};
+    localtime_s(&tm_tom, &next_day_ts);
+
+    std::string day_lbl;
+    if (tm_s.tm_year == tm_now.tm_year && tm_s.tm_yday == tm_now.tm_yday) {
+        day_lbl = "Auj.";
+    } else if (tm_s.tm_year == tm_tom.tm_year && tm_s.tm_yday == tm_tom.tm_yday) {
+        day_lbl = "Demain";
+    } else {
+        char dbuf[16];
+        std::snprintf(dbuf, sizeof(dbuf), "%02d/%02d", tm_s.tm_mday, tm_s.tm_mon + 1);
+        day_lbl = dbuf;
+    }
+
+    char tbuf[32];
+    std::snprintf(tbuf, sizeof(tbuf), "%02d:%02d-%02d:%02d",
+                  tm_s.tm_hour, tm_s.tm_min, tm_e.tm_hour, tm_e.tm_min);
+    return day_lbl + " " + tbuf;
+}
+
+static std::string fmt_ev_countdown(std::time_t target_s) {
+    std::time_t now = std::time(nullptr);
+    if (target_s <= now) return "maintenant";
+    int64_t diff = target_s - now;
+    int days = static_cast<int>(diff / 86400);
+    int hrs  = static_cast<int>((diff % 86400) / 3600);
+    int mins = static_cast<int>((diff % 3600) / 60);
+    char buf[32];
+    if (days > 0) {
+        std::snprintf(buf, sizeof(buf), "dans %dj %dh", days, hrs);
+    } else if (hrs > 0) {
+        std::snprintf(buf, sizeof(buf), "dans %dh %02dm", hrs, mins);
+    } else {
+        std::snprintf(buf, sizeof(buf), "dans %d min", (std::max)(1, mins));
+    }
+    return buf;
+}
 
 static std::wstring u8_to_wd(const std::string& s) {
     if (s.empty()) return L"";
@@ -1653,8 +1704,16 @@ void MainWindow::drw_dsc_prvw(HDC hdc, const RECT& preview_rc) {
         SelectObject(hdc, m_font_discord_sub);
         SetTextColor(hdc, RGB(148, 155, 164));
         std::wstring w_inactive = utf8_to_wide("Hors tranche active (" + live_from + " - " + live_to + ")");
-        RECT rc_inact = { card_rc.left + 14, card_rc.top + 138, card_rc.right - 14, card_rc.top + 160 };
+        RECT rc_inact = { card_rc.left + 14, card_rc.top + 138, card_rc.right - 14, card_rc.top + 158 };
         DrawTextW(hdc, w_inactive.c_str(), -1, &rc_inact, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        if (!g_upcoming_evs.empty()) {
+            const auto& nxt = g_upcoming_evs[0];
+            std::wstring w_nxt = utf8_to_wide("Prochain event : " + nxt.summary + " (" + fmt_ev_slot(nxt) + ")");
+            SetTextColor(hdc, theme::COLOR_ACCENT);
+            RECT rc_nxt = { card_rc.left + 14, card_rc.top + 160, card_rc.right - 14, card_rc.top + 180 };
+            DrawTextW(hdc, w_nxt.c_str(), -1, &rc_nxt, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
     }
 
     // Statut IPC bas de carte
@@ -1681,7 +1740,7 @@ void MainWindow::drw_dsc_prvw(HDC hdc, const RECT& preview_rc) {
     const wchar_t* stat_str = m_rpc_is_online ? L"TRANSMISSION IPC ACTIVE" : L"DISCORD DECONNECTE";
     TextOutW(hdc, sdot_cx + 10, sdot_cy - 6, stat_str, static_cast<int>(wcslen(stat_str)));
 
-    // 3. Panneau Telemetrie technique sous la carte Discord
+    // 3. Panneau Evenements a venir & Telemetrie sous la carte Discord
     int telem_top = card_bottom + 14;
     int telem_bottom = preview_rc.bottom - 12;
     RECT telem_rc = { preview_rc.left + card_pad, telem_top, preview_rc.right - card_pad, telem_bottom };
@@ -1692,27 +1751,63 @@ void MainWindow::drw_dsc_prvw(HDC hdc, const RECT& preview_rc) {
 
     SelectObject(hdc, m_font_section);
     SetTextColor(hdc, theme::COLOR_ACCENT);
-    TextOutW(hdc, telem_rc.left + 10, telem_top + 8, L"TELEMETRIE DE CHARGE UTILE (PAYLOAD)", 36);
+    TextOutW(hdc, telem_rc.left + 10, telem_top + 8, L"EVENEMENTS A VENIR (GOOGLE CALENDAR)", 36);
 
     SelectObject(hdc, m_font_mono);
-    SetTextColor(hdc, theme::COLOR_FG);
+    int ev_y = telem_top + 28;
+    int max_ev_bottom = telem_bottom - 68;
 
-    auto draw_kv = [&](int row, const wchar_t* key, const std::string& val) {
-        int y = telem_top + 28 + row * 18;
-        if (y + 16 > telem_bottom) return;
-        TextOutW(hdc, telem_rc.left + 10, y, key, static_cast<int>(wcslen(key)));
-        std::wstring wval = utf8_to_wide(val.empty() ? "(aucun)" : val);
-        RECT val_rc = { telem_rc.left + 130, y, telem_rc.right - 10, y + 16 };
-        SetTextColor(hdc, theme::COLOR_ACCENT);
-        DrawTextW(hdc, wval.c_str(), -1, &val_rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SetTextColor(hdc, theme::COLOR_FG);
-    };
+    if (g_current_cal_ev && g_current_cal_ev->end_time > now) {
+        SetTextColor(hdc, theme::COLOR_ONLINE);
+        std::string line_str = "[EN COURS] " + fmt_ev_slot(*g_current_cal_ev) + " | " + g_current_cal_ev->summary;
+        std::wstring wline = utf8_to_wide(line_str);
+        RECT ev_rc = { telem_rc.left + 10, ev_y, telem_rc.right - 10, ev_y + 18 };
+        DrawTextW(hdc, wline.c_str(), -1, &ev_rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        ev_y += 20;
+    }
 
-    draw_kv(0, L"LARGE ASSET :", live_large);
-    draw_kv(1, L"SMALL ASSET :", live_small);
-    draw_kv(2, L"PIPE CANAL  :", m_rpc.get_active_pipe_path());
-    draw_kv(3, L"CLIENT ID   :", m_rpc.get_client_id().empty() ? m_config.client_id : m_rpc.get_client_id());
-    draw_kv(4, L"STATUS      :", m_rpc_is_online ? "SYNCHRONISE" : "ATTENTE");
+    if (g_upcoming_evs.empty() && !(g_current_cal_ev && g_current_cal_ev->end_time > now)) {
+        SetTextColor(hdc, RGB(148, 155, 164));
+        RECT empty_rc = { telem_rc.left + 10, ev_y, telem_rc.right - 10, ev_y + 36 };
+        DrawTextW(hdc, L"Aucun evenement a venir detecte.\nSynchronisez une Adresse secrete au format iCal (.ics).", -1, &empty_rc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        ev_y += 40;
+    } else {
+        for (size_t i = 0; i < g_upcoming_evs.size(); ++i) {
+            if (ev_y + 18 > max_ev_bottom) break;
+            const auto& ev = g_upcoming_evs[i];
+            std::string slot_s = fmt_ev_slot(ev);
+            std::string cnt_s  = fmt_ev_countdown(ev.start_time);
+            std::string row_s  = slot_s + " (" + cnt_s + ") : " + ev.summary;
+            std::wstring wrow  = utf8_to_wide(row_s);
+
+            SetTextColor(hdc, (i == 0) ? theme::COLOR_FG : theme::COLOR_ACCENT);
+            RECT ev_rc = { telem_rc.left + 10, ev_y, telem_rc.right - 10, ev_y + 18 };
+            DrawTextW(hdc, wrow.c_str(), -1, &ev_rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            ev_y += 19;
+        }
+    }
+
+    // Ligne separatrice basse pour la telemetrie IPC compacte
+    int sep_y = telem_bottom - 58;
+    if (sep_y > telem_top + 48) {
+        MoveToEx(hdc, telem_rc.left + 10, sep_y, nullptr);
+        LineTo(hdc, telem_rc.right - 10, sep_y);
+
+        auto draw_kv_bottom = [&](int row, const wchar_t* key, const std::string& val) {
+            int y = sep_y + 6 + row * 16;
+            if (y + 15 > telem_bottom) return;
+            SetTextColor(hdc, theme::COLOR_FG);
+            TextOutW(hdc, telem_rc.left + 10, y, key, static_cast<int>(wcslen(key)));
+            std::wstring wval = utf8_to_wide(val.empty() ? "(aucun)" : val);
+            RECT val_rc = { telem_rc.left + 120, y, telem_rc.right - 10, y + 15 };
+            SetTextColor(hdc, theme::COLOR_ACCENT);
+            DrawTextW(hdc, wval.c_str(), -1, &val_rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        };
+
+        draw_kv_bottom(0, L"PIPE CANAL :", m_rpc.get_active_pipe_path());
+        draw_kv_bottom(1, L"CLIENT ID  :", m_rpc.get_client_id().empty() ? m_config.client_id : m_rpc.get_client_id());
+        draw_kv_bottom(2, L"STATUS     :", m_rpc_is_online ? "SYNCHRONISE" : "ATTENTE");
+    }
 }
 
 void MainWindow::drw_ownr_btn(LPDRAWITEMSTRUCT dis) {
@@ -2172,9 +2267,12 @@ void MainWindow::on_dbg_tst_cal_clk() {
         if (ok) {
             auto events = test_cal.parse_events(content);
             auto cur = test_cal.get_current_event(events);
-            std::string msg = "statut agenda: flux valide (" + std::to_string(events.size()) + " evenements detectes";
+            auto upcm = test_cal.get_upcoming_events(events, 6);
+            std::string msg = "statut agenda: flux valide (" + std::to_string(events.size()) + " evenements, " + std::to_string(upcm.size()) + " a venir";
             if (cur) {
                 msg += ", actif: " + cur->summary;
+            } else if (!upcm.empty()) {
+                msg += ", prochain: " + upcm[0].summary;
             } else {
                 msg += ", aucun actif maintenant";
             }
@@ -2239,6 +2337,11 @@ void MainWindow::on_sync_cal_clk() {
     SetWindowTextW(m_dbg_edit_ical_url, u8_to_wd(ical_url).c_str());
     m_config.auto_sync = (SendMessageW(m_chk_auto_sync, BM_GETCHECK, 0, 0) == BST_CHECKED);
     config::ConfigManager::save(m_config);
+
+    KillTimer(m_hwnd, TIMER_ID_CALENDAR);
+    if (m_config.auto_sync && !m_config.ical_url.empty()) {
+        SetTimer(m_hwnd, TIMER_ID_CALENDAR, static_cast<UINT>(m_config.sync_interval_seconds * 1000), nullptr);
+    }
 
     trg_async_cal_sync();
 }
@@ -2337,9 +2440,11 @@ void MainWindow::trg_async_cal_sync() {
         if (m_calendar.ftch_cal(url, cnt, err)) {
             auto evs = m_calendar.prs_evs(cnt);
             auto crr = m_calendar.get_crr_ev(evs);
+            res->upcoming = m_calendar.get_upcm_evs(evs, 6);
             res->success = true;
             if (crr) {
                 res->summary = crr->smm();
+                res->start_time = crr->tm_s();
                 res->end_time = crr->tm_e();
             }
         } else {
@@ -2357,12 +2462,21 @@ void MainWindow::hndl_cal_sync_cmplt(bool ok, const std::string& smm, std::time_
     if (!ok) {
         upd_cal_st_lbl("erreur: " + smm, false);
         log_dbg("CAL", "Erreur synchronisation agenda: " + smm);
+        InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
 
     if (smm.empty()) {
-        upd_cal_st_lbl("aucun evenement actif", false);
-        log_dbg("CAL", "Synchronisation reussie: aucun evenement en cours.");
+        if (!g_upcoming_evs.empty()) {
+            const auto& nxt = g_upcoming_evs[0];
+            std::string nxt_txt = "prochain : " + nxt.summary + " (" + fmt_ev_slot(nxt) + ", " + fmt_ev_countdown(nxt.start_time) + ")";
+            upd_cal_st_lbl(nxt_txt, false);
+            log_dbg("CAL", "Aucun evenement en cours. Prochain: " + nxt.summary + " (" + fmt_ev_slot(nxt) + ")");
+        } else {
+            upd_cal_st_lbl("aucun evenement en cours ni a venir", false);
+            log_dbg("CAL", "Synchronisation reussie: aucun evenement en cours ni a venir.");
+        }
+        InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
 
@@ -2371,26 +2485,35 @@ void MainWindow::hndl_cal_sync_cmplt(bool ok, const std::string& smm, std::time_
     char tm_buf[32];
     std::strftime(tm_buf, sizeof(tm_buf), "%H:%M", &end_tm);
 
-    std::string st_txt = smm + " (fin: " + tm_buf + ")";
+    std::string st_txt = "en cours : " + smm + " (fin: " + tm_buf + ")";
+    if (!g_upcoming_evs.empty()) {
+        st_txt += " | suivant : " + fmt_ev_slot(g_upcoming_evs[0]);
+    }
     upd_cal_st_lbl(st_txt, true);
     log_dbg("CAL", "Evenement actif detecte: " + smm + " jusqu'a " + tm_buf);
 
     if (m_rpc.is_cnnctd()) {
+        std::string cur_det = get_window_text_utf8(m_edit_details);
+        std::string cur_st  = get_window_text_utf8(m_edit_state);
+        std::string cur_lrg = resolve_image_url(get_window_text_utf8(m_edit_large_img));
+        std::string cur_sml = resolve_image_url(get_window_text_utf8(m_edit_small_img));
+
         discord::Actvty act;
-        act.details = smm;
-        act.state = "Fin a " + std::string(tm_buf);
+        act.details = cur_det.empty() ? smm : cur_det;
+        act.state   = cur_st.empty()  ? ("Fin a " + std::string(tm_buf)) : cur_st;
         act.end_time = tm_e;
 
-        if (!m_config.custom_large_image.empty()) {
-            act.large_image = m_config.custom_large_image;
+        if (!cur_lrg.empty()) {
+            act.large_image = cur_lrg;
             act.large_text = smm;
         }
-        if (!m_config.custom_small_image.empty()) {
-            act.small_image = m_config.custom_small_image;
+        if (!cur_sml.empty()) {
+            act.small_image = cur_sml;
             act.small_text = "Agenda Google";
         }
 
         m_activity_start_time = std::time(nullptr);
+        m_activity_end_time   = tm_e;
         m_rpc.set_actvty(act);
         log_dbg("RPC", "Rich Presence mise a jour depuis l'agenda: " + smm);
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -2697,6 +2820,18 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CALENDAR_SYNC_DONE: {
             auto res = reinterpret_cast<CalSyncRes*>(lp);
             if (res) {
+                if (res->success) {
+                    g_upcoming_evs = res->upcoming;
+                    if (!res->summary.empty() && res->end_time > 0) {
+                        cal::CalEvnt cev;
+                        cev.summary = res->summary;
+                        cev.start_time = res->start_time;
+                        cev.end_time = res->end_time;
+                        g_current_cal_ev = cev;
+                    } else {
+                        g_current_cal_ev = std::nullopt;
+                    }
+                }
                 hndl_cal_sync_cmplt(res->success, res->summary, res->end_time);
                 delete res;
             }
@@ -2825,13 +2960,31 @@ LRESULT MainWindow::hndl_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         upd_rpc_st_lbl("hors tranche (" + g_sched.time_from + " - " + g_sched.time_to + ") - activite masquee", true);
                         log_dbg("RPC", "Fin de tranche active (" + g_sched.time_from + " - " + g_sched.time_to + "): activite effacee.");
                     }
-                } else if (m_cal_is_active && m_activity_end_time > 0 && now >= m_activity_end_time) {
-                    if (m_rpc.is_connected()) {
-                        m_rpc.clear_activity();
+                } else {
+                    if (g_current_cal_ev && now >= g_current_cal_ev->end_time) {
+                        g_current_cal_ev = std::nullopt;
+                        if (m_rpc.is_connected()) {
+                            m_rpc.clear_activity();
+                        }
+                        m_activity_start_time = 0;
+                        m_activity_end_time = 0;
+                        hndl_cal_sync_cmplt(true, "", 0);
                     }
-                    m_activity_start_time = 0;
-                    m_activity_end_time = 0;
-                    upd_cal_st_lbl("aucun evenement actif", false);
+                    if (!g_current_cal_ev && !g_upcoming_evs.empty()) {
+                        while (!g_upcoming_evs.empty() && g_upcoming_evs.front().end_time <= now) {
+                            g_upcoming_evs.erase(g_upcoming_evs.begin());
+                        }
+                        if (!g_upcoming_evs.empty() && now >= g_upcoming_evs.front().start_time && now < g_upcoming_evs.front().end_time) {
+                            cal::CalEvnt cev = g_upcoming_evs.front();
+                            g_upcoming_evs.erase(g_upcoming_evs.begin());
+                            g_current_cal_ev = cev;
+                            hndl_cal_sync_cmplt(true, cev.summary, cev.end_time);
+                        } else if (!g_upcoming_evs.empty() && (now % 30 == 0)) {
+                            const auto& nxt = g_upcoming_evs.front();
+                            std::string nxt_txt = "prochain : " + nxt.summary + " (" + fmt_ev_slot(nxt) + ", " + fmt_ev_countdown(nxt.start_time) + ")";
+                            upd_cal_st_lbl(nxt_txt, false);
+                        }
+                    }
                 }
                 if (m_current_view == ViewMode::Activity && m_show_preview) {
                     InvalidateRect(m_hwnd, nullptr, FALSE);

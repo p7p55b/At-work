@@ -81,13 +81,66 @@ std::time_t CalClnt::prs_ts(const std::string& s_dt) {
     }
 }
 
-bool CalClnt::ftch_cal(const std::string& url, std::string& out_cnt, std::string& out_err) {
+static std::string b64_dec(const std::string& in) {
+    static const int T[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+    };
+    std::string out;
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (c >= 128 || T[c] == -1) break;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(char((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+static std::string url_enc(const std::string& s) {
+    std::string r;
+    const char* hex = "0123456789ABCDEF";
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            r.push_back(static_cast<char>(c));
+        } else {
+            r.push_back('%');
+            r.push_back(hex[(c >> 4) & 0xF]);
+            r.push_back(hex[c & 0xF]);
+        }
+    }
+    return r;
+}
+
+bool CalClnt::ftch_cal(const std::string& raw_url, std::string& out_cnt, std::string& out_err) {
     out_cnt.clear();
     out_err.clear();
 
-    if (url.empty()) {
+    if (raw_url.empty()) {
         out_err = "URL d'agenda vide.";
         return false;
+    }
+
+    std::string url = raw_url;
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+        url = "https://" + url;
+    }
+
+    // Conversion automatique si l'utilisateur a colle un lien ?cid= ou ?src= au lieu d'un .ics
+    size_t cid_pos = url.find("cid=");
+    if (cid_pos != std::string::npos && url.find(".ics") == std::string::npos) {
+        std::string cid = url.substr(cid_pos + 4);
+        size_t amp = cid.find('&');
+        if (amp != std::string::npos) cid = cid.substr(0, amp);
+        std::string dec = b64_dec(cid);
+        if (!dec.empty() && dec.find('@') != std::string::npos) {
+            url = "https://calendar.google.com/calendar/ical/" + url_enc(dec) + "/public/basic.ics";
+        }
     }
 
     int w_len = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
@@ -170,8 +223,12 @@ bool CalClnt::ftch_cal(const std::string& url, std::string& out_cnt, std::string
     DWORD sc_sz = sizeof(sc);
     if (WinHttpQueryHeaders(rq.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &sc, &sc_sz, WINHTTP_NO_HEADER_INDEX)) {
+        if (sc == 404 && raw_url.find("cid=") != std::string::npos) {
+            out_err = "Agenda prive : collez 'Adresse secrete au format iCal' (.ics) des parametres Google Calendar";
+            return false;
+        }
         if (sc != 200) {
-            out_err = "Erreur HTTP statut: " + std::to_string(sc);
+            out_err = "Erreur HTTP statut: " + std::to_string(sc) + " (verifiez l'Adresse secrete au format iCal .ics)";
             return false;
         }
     }
@@ -187,6 +244,11 @@ bool CalClnt::ftch_cal(const std::string& url, std::string& out_cnt, std::string
         out_cnt.append(buf, b_rd);
     }
 
+    if (out_cnt.find("BEGIN:VCALENDAR") == std::string::npos) {
+        out_err = "Lien non-iCal : collez 'Adresse secrete au format iCal' (.ics) des parametres Google Calendar";
+        return false;
+    }
+
     return true;
 }
 
@@ -199,6 +261,8 @@ std::vector<CalEvnt> CalClnt::prs_evs(const std::string& raw) {
 
     bool in_vnt = false;
     CalEvnt crr;
+    std::string rrule;
+    std::time_t now = std::time(nullptr);
 
     while (std::getline(ss, ln)) {
         if (!ln.empty() && ln.back() == '\r') {
@@ -208,12 +272,51 @@ std::vector<CalEvnt> CalClnt::prs_evs(const std::string& raw) {
         if (ln == "BEGIN:VEVENT") {
             in_vnt = true;
             crr = CalEvnt{};
+            rrule.clear();
             continue;
         }
 
         if (ln == "END:VEVENT") {
             if (in_vnt && crr.end_time > crr.start_time) {
+                if (crr.summary.empty()) {
+                    crr.summary = "(Sans titre)";
+                }
                 evs.push_back(crr);
+
+                // Expansion basique des evenements recurrents (FREQ=DAILY / FREQ=WEEKLY)
+                if (!rrule.empty()) {
+                    int step_days = 0;
+                    if (rrule.find("FREQ=DAILY") != std::string::npos) step_days = 1;
+                    else if (rrule.find("FREQ=WEEKLY") != std::string::npos) step_days = 7;
+
+                    if (step_days > 0) {
+                        std::time_t until_ts = now + 14 * 24 * 3600;
+                        size_t u_pos = rrule.find("UNTIL=");
+                        if (u_pos != std::string::npos) {
+                            std::string u_str = rrule.substr(u_pos + 6);
+                            size_t sc_pos = u_str.find(';');
+                            if (sc_pos != std::string::npos) u_str = u_str.substr(0, sc_pos);
+                            std::time_t parsed_u = prs_ts(u_str);
+                            if (parsed_u > 0 && parsed_u < until_ts) until_ts = parsed_u;
+                        }
+                        std::time_t dur = crr.end_time - crr.start_time;
+                        std::tm tm_iter = {};
+                        localtime_s(&tm_iter, &crr.start_time);
+                        for (int k = 1; k <= 520; ++k) {
+                            tm_iter.tm_mday += step_days;
+                            tm_iter.tm_isdst = -1;
+                            std::time_t occ_s = std::mktime(&tm_iter);
+                            if (occ_s <= 0 || occ_s > until_ts) break;
+                            std::time_t occ_e = occ_s + dur;
+                            if (occ_e >= now - 24 * 3600) {
+                                CalEvnt occ = crr;
+                                occ.start_time = occ_s;
+                                occ.end_time = occ_e;
+                                evs.push_back(occ);
+                            }
+                        }
+                    }
+                }
             }
             in_vnt = false;
             continue;
@@ -238,8 +341,14 @@ std::vector<CalEvnt> CalClnt::prs_evs(const std::string& raw) {
             crr.start_time = prs_ts(v_prt);
         } else if (prp == "DTEND") {
             crr.end_time = prs_ts(v_prt);
+        } else if (prp == "RRULE") {
+            rrule = v_prt;
         }
     }
+
+    std::sort(evs.begin(), evs.end(), [](const CalEvnt& a, const CalEvnt& b) {
+        return a.start_time < b.start_time;
+    });
 
     return evs;
 }
@@ -256,6 +365,28 @@ std::optional<CalEvnt> CalClnt::get_crr_ev(const std::vector<CalEvnt>& evs, std:
     }
 
     return std::nullopt;
+}
+
+std::vector<CalEvnt> CalClnt::get_upcm_evs(const std::vector<CalEvnt>& evs, size_t max_cnt, std::time_t ref_tm) {
+    if (ref_tm == 0) {
+        ref_tm = std::time(nullptr);
+    }
+
+    std::vector<CalEvnt> out;
+    for (const auto& ev : evs) {
+        if (ev.start_time > ref_tm) {
+            out.push_back(ev);
+        }
+    }
+
+    std::sort(out.begin(), out.end(), [](const CalEvnt& a, const CalEvnt& b) {
+        return a.start_time < b.start_time;
+    });
+
+    if (out.size() > max_cnt) {
+        out.resize(max_cnt);
+    }
+    return out;
 }
 
 } // namespace cal
